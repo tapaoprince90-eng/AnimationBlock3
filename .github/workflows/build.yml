@@ -1,0 +1,995 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.8
+      - name: Create files
+        run: |
+          mkdir -p src/main/java/com/example/animtool/client src/main/resources
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx1G
+          minecraft_version=1.21.1
+          yarn_mappings=1.21.1+build.3
+          loader_version=0.16.5
+          fabric_version=0.102.0+1.21.1
+          mod_version=1.0.0
+          maven_group=com.example
+          archives_base_name=animtool
+          EOF
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.7-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "animtool",
+            "version": "${version}",
+            "name": "Animation Tool",
+            "description": "Paper timeline and stick mover to animate blocks.",
+            "authors": ["You"],
+            "environment": "*",
+            "entrypoints": {
+              "main": ["com.example.animtool.AnimToolMod"],
+              "client": ["com.example.animtool.client.AnimToolClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.1",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/java/com/example/animtool/ClientMsg.java <<'EOF'
+          package com.example.animtool;
+
+          import io.netty.buffer.ByteBuf;
+          import net.minecraft.network.codec.PacketCodec;
+          import net.minecraft.network.codec.PacketCodecs;
+          import net.minecraft.network.packet.CustomPayload;
+          import net.minecraft.util.Identifier;
+
+          public record ClientMsg(String text) implements CustomPayload {
+              public static final CustomPayload.Id<ClientMsg> ID = new CustomPayload.Id<>(Identifier.of("animtool", "c2s"));
+              public static final PacketCodec<ByteBuf, ClientMsg> CODEC = PacketCodecs.STRING.xmap(ClientMsg::new, ClientMsg::text);
+
+              @Override
+              public CustomPayload.Id<? extends CustomPayload> getId() {
+                  return ID;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/animtool/ServerMsg.java <<'EOF'
+          package com.example.animtool;
+
+          import io.netty.buffer.ByteBuf;
+          import net.minecraft.network.codec.PacketCodec;
+          import net.minecraft.network.codec.PacketCodecs;
+          import net.minecraft.network.packet.CustomPayload;
+          import net.minecraft.util.Identifier;
+
+          public record ServerMsg(String text) implements CustomPayload {
+              public static final CustomPayload.Id<ServerMsg> ID = new CustomPayload.Id<>(Identifier.of("animtool", "s2c"));
+              public static final PacketCodec<ByteBuf, ServerMsg> CODEC = PacketCodecs.STRING.xmap(ServerMsg::new, ServerMsg::text);
+
+              @Override
+              public CustomPayload.Id<? extends CustomPayload> getId() {
+                  return ID;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/animtool/AnimToolMod.java <<'EOF'
+          package com.example.animtool;
+
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+          import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+          import net.fabricmc.fabric.api.event.player.UseItemCallback;
+          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.entity.decoration.DisplayEntity;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.server.command.CommandManager;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.ActionResult;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.TypedActionResult;
+
+          public class AnimToolMod implements ModInitializer {
+              @Override
+              public void onInitialize() {
+                  PayloadTypeRegistry.playC2S().register(ClientMsg.ID, ClientMsg.CODEC);
+                  PayloadTypeRegistry.playS2C().register(ServerMsg.ID, ServerMsg.CODEC);
+
+                  ServerPlayNetworking.registerGlobalReceiver(ClientMsg.ID,
+                      (payload, ctx) -> AnimServer.handle(ctx.player(), payload.text()));
+
+                  CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+                      for (String name : new String[]{"animation", "Animation"}) {
+                          dispatcher.register(CommandManager.literal(name).executes(ctx -> {
+                              ServerPlayerEntity pl = ctx.getSource().getPlayerOrThrow();
+                              pl.giveItemStack(AnimServer.makePaper());
+                              pl.giveItemStack(AnimServer.makeStick());
+                              ctx.getSource().sendFeedback(() -> Text.literal("Given: Animation Timeline (paper) and Animation Mover (stick)"), false);
+                              return 1;
+                          }));
+                      }
+                  });
+
+                  UseBlockCallback.EVENT.register((player, world, hand, hit) -> {
+                      if (hand != Hand.MAIN_HAND) return ActionResult.PASS;
+                      ItemStack st = player.getStackInHand(hand);
+                      boolean paper = AnimServer.isPaper(st);
+                      boolean stick = AnimServer.isStick(st);
+                      if (!paper && !stick) return ActionResult.PASS;
+                      if (!(player instanceof ServerPlayerEntity sp)) return ActionResult.SUCCESS;
+                      if (paper) AnimServer.openPaper(sp);
+                      else AnimServer.stickUse(sp, hit);
+                      return ActionResult.SUCCESS;
+                  });
+
+                  UseItemCallback.EVENT.register((player, world, hand) -> {
+                      ItemStack st = player.getStackInHand(hand);
+                      if (hand != Hand.MAIN_HAND) return TypedActionResult.pass(st);
+                      boolean paper = AnimServer.isPaper(st);
+                      boolean stick = AnimServer.isStick(st);
+                      if (!paper && !stick) return TypedActionResult.pass(st);
+                      if (!(player instanceof ServerPlayerEntity sp)) return TypedActionResult.success(st);
+                      if (paper) AnimServer.openPaper(sp);
+                      else AnimServer.stickUse(sp, null);
+                      return TypedActionResult.success(st);
+                  });
+
+                  ServerTickEvents.END_SERVER_TICK.register(AnimServer::tick);
+                  ServerLifecycleEvents.SERVER_STOPPED.register(server -> AnimServer.reset());
+                  ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> {
+                      if (entity instanceof DisplayEntity.BlockDisplayEntity && AnimServer.isMarked(entity)) {
+                          AnimServer.load(entity);
+                      }
+                  });
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/animtool/AnimServer.java <<'EOF'
+          package com.example.animtool;
+
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.block.Block;
+          import net.minecraft.block.BlockState;
+          import net.minecraft.block.Blocks;
+          import net.minecraft.component.DataComponentTypes;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.EntityType;
+          import net.minecraft.entity.decoration.DisplayEntity;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.nbt.NbtCompound;
+          import net.minecraft.nbt.NbtFloat;
+          import net.minecraft.nbt.NbtHelper;
+          import net.minecraft.nbt.NbtList;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+          import net.minecraft.util.hit.BlockHitResult;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.util.math.Vec3d;
+          import org.joml.Quaternionf;
+          import org.joml.Vector3f;
+
+          public class AnimServer {
+              static class Obj {
+                  final Map<Integer, float[]> frames = new HashMap<>();
+              }
+
+              static class Undo {
+                  UUID id;
+                  int frame;
+                  float[] old;
+                  boolean addFrame;
+                  long time;
+              }
+
+              static final Map<UUID, Obj> objs = new HashMap<>();
+              static final Map<UUID, UUID> selected = new HashMap<>();
+              static final ArrayDeque<Undo> undo = new ArrayDeque<>();
+              static final ArrayList<Integer> dur = new ArrayList<>();
+              static int count = 2;
+              static int cur = 0;
+              static int timer = 0;
+              static boolean playing = false;
+
+              static {
+                  reset();
+              }
+
+              public static void reset() {
+                  objs.clear();
+                  selected.clear();
+                  undo.clear();
+                  dur.clear();
+                  count = 2;
+                  cur = 0;
+                  timer = 0;
+                  playing = false;
+                  dur.add(20);
+                  dur.add(20);
+              }
+
+              // ---------- items ----------
+              public static ItemStack makePaper() {
+                  ItemStack s = new ItemStack(Items.PAPER);
+                  s.set(DataComponentTypes.CUSTOM_NAME, Text.literal("Animation Timeline").formatted(Formatting.AQUA));
+                  s.set(DataComponentTypes.ENCHANTMENT_GLINT_OVERRIDE, true);
+                  return s;
+              }
+
+              public static ItemStack makeStick() {
+                  ItemStack s = new ItemStack(Items.STICK);
+                  s.set(DataComponentTypes.CUSTOM_NAME, Text.literal("Animation Mover").formatted(Formatting.GOLD));
+                  s.set(DataComponentTypes.ENCHANTMENT_GLINT_OVERRIDE, true);
+                  return s;
+              }
+
+              public static boolean isPaper(ItemStack s) {
+                  return s.isOf(Items.PAPER) && s.contains(DataComponentTypes.ENCHANTMENT_GLINT_OVERRIDE);
+              }
+
+              public static boolean isStick(ItemStack s) {
+                  return s.isOf(Items.STICK) && s.contains(DataComponentTypes.ENCHANTMENT_GLINT_OVERRIDE);
+              }
+
+              // ---------- messaging ----------
+              static void msg(ServerPlayerEntity p, String s) {
+                  p.sendMessage(Text.literal(s), true);
+              }
+
+              static void send(ServerPlayerEntity p, String s) {
+                  ServerPlayNetworking.send(p, new ServerMsg(s));
+              }
+
+              static void sendState(ServerPlayerEntity p) {
+                  send(p, "S " + cur + " " + count + " " + (playing ? 1 : 0) + " " + dur.get(cur));
+              }
+
+              static void sendPose(MinecraftServer s, ServerPlayerEntity p) {
+                  UUID id = selected.get(p.getUuid());
+                  Entity e = id == null ? null : find(s, id);
+                  Obj o = id == null ? null : objs.get(id);
+                  if (e == null || o == null) {
+                      send(p, "P none");
+                      return;
+                  }
+                  float[] q = pose(o, cur);
+                  send(p, "P " + q[0] + " " + q[1] + " " + q[2] + " " + q[3] + " " + q[4] + " " + q[5]);
+              }
+
+              static void sync(MinecraftServer s) {
+                  for (ServerPlayerEntity p : s.getPlayerManager().getPlayerList()) {
+                      sendState(p);
+                      sendPose(s, p);
+                  }
+              }
+
+              // ---------- object data ----------
+              public static boolean isMarked(Entity e) {
+                  return e.getCommandTags().contains("ta_obj");
+              }
+
+              static Entity find(MinecraftServer s, UUID id) {
+                  for (ServerWorld w : s.getWorlds()) {
+                      Entity e = w.getEntity(id);
+                      if (e != null) return e;
+                  }
+                  return null;
+              }
+
+              public static Obj load(Entity e) {
+                  Obj o = objs.get(e.getUuid());
+                  if (o != null) return o;
+                  o = new Obj();
+                  for (String t : new ArrayList<>(e.getCommandTags())) {
+                      if (!t.startsWith("ta_f:")) continue;
+                      String[] sp = t.split(":");
+                      if (sp.length != 8) continue;
+                      try {
+                          int i = Integer.parseInt(sp[1]);
+                          float[] p = new float[6];
+                          for (int k = 0; k < 6; k++) p[k] = Float.parseFloat(sp[2 + k]);
+                          o.frames.put(i, p);
+                          while (count <= i) {
+                              count++;
+                              dur.add(20);
+                          }
+                      } catch (RuntimeException ex) {
+                          // ignore bad tag
+                      }
+                  }
+                  objs.put(e.getUuid(), o);
+                  return o;
+              }
+
+              static float[] pose(Obj o, int frame) {
+                  for (int f = frame; f >= 0; f--) {
+                      float[] p = o.frames.get(f);
+                      if (p != null) return p.clone();
+                  }
+                  return new float[6];
+              }
+
+              static void writeTags(Entity e, Obj o, int frame) {
+                  String prefix = "ta_f:" + frame + ":";
+                  for (String t : new ArrayList<>(e.getCommandTags())) {
+                      if (t.startsWith(prefix)) e.removeCommandTag(t);
+                  }
+                  float[] p = o.frames.get(frame);
+                  if (p != null) {
+                      e.addCommandTag(prefix + p[0] + ":" + p[1] + ":" + p[2] + ":" + p[3] + ":" + p[4] + ":" + p[5]);
+                  }
+              }
+
+              static void prune(Entity e) {
+                  for (String t : new ArrayList<>(e.getCommandTags())) {
+                      if (!t.startsWith("ta_f:")) continue;
+                      try {
+                          int i = Integer.parseInt(t.split(":")[1]);
+                          if (i >= count) e.removeCommandTag(t);
+                      } catch (RuntimeException ex) {
+                          // ignore
+                      }
+                  }
+              }
+
+              // ---------- applying a pose (smooth via display interpolation) ----------
+              static NbtList fl(float... v) {
+                  NbtList l = new NbtList();
+                  for (float f : v) l.add(NbtFloat.of(f));
+                  return l;
+              }
+
+              static void applyPose(Entity e, float[] p, int duration) {
+                  Quaternionf q = new Quaternionf().rotationXYZ(
+                      (float) Math.toRadians(p[3]), (float) Math.toRadians(p[4]), (float) Math.toRadians(p[5]));
+                  Vector3f c = new Vector3f(0.5f, 0.5f, 0.5f);
+                  q.transform(c);
+                  NbtCompound tr = new NbtCompound();
+                  tr.put("left_rotation", fl(q.x, q.y, q.z, q.w));
+                  tr.put("right_rotation", fl(0f, 0f, 0f, 1f));
+                  tr.put("translation", fl(p[0] + 0.5f - c.x, p[1] + 0.5f - c.y, p[2] + 0.5f - c.z));
+                  tr.put("scale", fl(1f, 1f, 1f));
+                  NbtCompound n = e.writeNbt(new NbtCompound());
+                  n.put("transformation", tr);
+                  n.putInt("start_interpolation", 0);
+                  n.putInt("interpolation_duration", duration);
+                  UUID u = e.getUuid();
+                  e.readNbt(n);
+                  e.setUuid(u);
+              }
+
+              static void applyAll(MinecraftServer s, int d) {
+                  for (Map.Entry<UUID, Obj> en : objs.entrySet()) {
+                      Entity e = find(s, en.getKey());
+                      if (e != null) applyPose(e, pose(en.getValue(), cur), d);
+                  }
+              }
+
+              // ---------- undo ----------
+              static void pushUndo(Undo u) {
+                  undo.addLast(u);
+                  while (undo.size() > 60) undo.pollFirst();
+              }
+
+              static void pushEdit(UUID id, int frame, float[] old) {
+                  long now = System.currentTimeMillis();
+                  Undo top = undo.peekLast();
+                  if (top != null && !top.addFrame && top.id.equals(id) && top.frame == frame && now - top.time < 700) {
+                      top.time = now;
+                      return;
+                  }
+                  Undo u = new Undo();
+                  u.id = id;
+                  u.frame = frame;
+                  u.old = old;
+                  u.time = now;
+                  pushUndo(u);
+              }
+
+              static void doUndo(ServerPlayerEntity p, MinecraftServer s) {
+                  Undo u = undo.pollLast();
+                  if (u == null) {
+                      msg(p, "Nothing to undo");
+                      return;
+                  }
+                  playing = false;
+                  if (u.addFrame) {
+                      if (count > 2) {
+                          count--;
+                          dur.remove(dur.size() - 1);
+                          for (Map.Entry<UUID, Obj> en : objs.entrySet()) {
+                              en.getValue().frames.keySet().removeIf(k -> k >= count);
+                              Entity e = find(s, en.getKey());
+                              if (e != null) prune(e);
+                          }
+                          if (cur >= count) cur = count - 1;
+                      }
+                  } else {
+                      Obj o = objs.get(u.id);
+                      Entity e = find(s, u.id);
+                      if (o != null) {
+                          if (u.old == null) o.frames.remove(u.frame);
+                          else o.frames.put(u.frame, u.old);
+                          if (e != null) writeTags(e, o, u.frame);
+                      }
+                      if (u.frame < count) cur = u.frame;
+                  }
+                  applyAll(s, 8);
+                  sync(s);
+                  msg(p, "Undone");
+              }
+
+              // ---------- timeline actions ----------
+              static void gotoFrame(MinecraftServer s, int n) {
+                  playing = false;
+                  cur = Math.max(0, Math.min(count - 1, n));
+                  applyAll(s, 8);
+                  sync(s);
+              }
+
+              static void play(MinecraftServer s) {
+                  if (count < 2) return;
+                  if (cur >= count - 1) {
+                      cur = 0;
+                      applyAll(s, 2);
+                  }
+                  playing = true;
+                  timer = 6;
+                  sync(s);
+              }
+
+              static void addFrame(ServerPlayerEntity p, MinecraftServer s) {
+                  if (count >= 30) {
+                      msg(p, "Maximum 30 frames");
+                      return;
+                  }
+                  count++;
+                  dur.add(20);
+                  Undo u = new Undo();
+                  u.addFrame = true;
+                  pushUndo(u);
+                  playing = false;
+                  cur = count - 1;
+                  applyAll(s, 8);
+                  sync(s);
+                  msg(p, "Frame " + count + " added");
+              }
+
+              static void changeTime(MinecraftServer s, int d) {
+                  if (cur == 0) return;
+                  int v = Math.max(1, Math.min(1200, dur.get(cur) + d));
+                  dur.set(cur, v);
+                  sync(s);
+              }
+
+              public static void tick(MinecraftServer s) {
+                  if (!playing) return;
+                  timer--;
+                  if (timer > 0) return;
+                  if (cur + 1 < count) {
+                      cur++;
+                      int d = dur.get(cur);
+                      applyAll(s, d);
+                      timer = d;
+                      sync(s);
+                  } else {
+                      playing = false;
+                      sync(s);
+                  }
+              }
+
+              // ---------- stick actions ----------
+              static void setPose(ServerPlayerEntity p, MinecraftServer s, String[] a) {
+                  UUID id = selected.get(p.getUuid());
+                  if (id == null) return;
+                  Entity e = find(s, id);
+                  Obj o = objs.get(id);
+                  if (e == null || o == null) return;
+                  float[] n = new float[6];
+                  for (int i = 0; i < 6; i++) {
+                      float v = Float.parseFloat(a[2 + i]);
+                      float lim = i < 3 ? 6f : 180f;
+                      n[i] = Math.max(-lim, Math.min(lim, v));
+                  }
+                  float[] old = o.frames.get(cur);
+                  pushEdit(id, cur, old == null ? null : old.clone());
+                  o.frames.put(cur, n);
+                  writeTags(e, o, cur);
+                  applyPose(e, n, 4);
+              }
+
+              static void resetFrame(ServerPlayerEntity p, MinecraftServer s) {
+                  UUID id = selected.get(p.getUuid());
+                  if (id == null) return;
+                  Entity e = find(s, id);
+                  Obj o = objs.get(id);
+                  if (e == null || o == null) return;
+                  float[] old = o.frames.get(cur);
+                  if (old == null) {
+                      msg(p, "Nothing to reset on this frame");
+                      return;
+                  }
+                  pushEdit(id, cur, old.clone());
+                  o.frames.remove(cur);
+                  writeTags(e, o, cur);
+                  applyPose(e, pose(o, cur), 6);
+                  sendPose(s, p);
+              }
+
+              static void putBack(ServerPlayerEntity p, MinecraftServer s) {
+                  UUID id = selected.get(p.getUuid());
+                  Entity e = id == null ? null : find(s, id);
+                  if (e == null) {
+                      msg(p, "Nothing selected");
+                      return;
+                  }
+                  BlockState st = null;
+                  for (String t : e.getCommandTags()) {
+                      if (t.startsWith("ta_state:")) {
+                          try {
+                              st = Block.getStateFromRawId(Integer.parseInt(t.substring(9)));
+                          } catch (RuntimeException ex) {
+                              st = null;
+                          }
+                      }
+                  }
+                  if (st == null) {
+                      msg(p, "Could not read the original block");
+                      return;
+                  }
+                  ServerWorld w = (ServerWorld) e.getWorld();
+                  BlockPos bp = e.getBlockPos();
+                  if (!w.getBlockState(bp).isAir()) {
+                      msg(p, "The original spot is not empty");
+                      return;
+                  }
+                  w.setBlockState(bp, st);
+                  e.discard();
+                  objs.remove(id);
+                  selected.values().removeIf(v -> v.equals(id));
+                  send(p, "P none");
+                  send(p, "CLOSE");
+                  msg(p, "Put back as a normal block");
+              }
+
+              // ---------- picking / converting ----------
+              static Entity pick(ServerPlayerEntity p, ServerWorld w, double maxDist) {
+                  Vec3d eye = p.getEyePos();
+                  Vec3d look = p.getRotationVec(1.0f);
+                  Entity best = null;
+                  double bestT = 1e9;
+                  List<DisplayEntity.BlockDisplayEntity> list = w.getEntitiesByClass(
+                      DisplayEntity.BlockDisplayEntity.class, p.getBoundingBox().expand(maxDist + 8), e -> isMarked(e));
+                  for (DisplayEntity.BlockDisplayEntity e : list) {
+                      Obj o = load(e);
+                      float[] ps = pose(o, cur);
+                      Vec3d c = new Vec3d(e.getX() + 0.5 + ps[0], e.getY() + 0.5 + ps[1], e.getZ() + 0.5 + ps[2]);
+                      double t = c.subtract(eye).dotProduct(look);
+                      if (t < 0 || t > maxDist + 0.6) continue;
+                      Vec3d closest = eye.add(look.multiply(t));
+                      if (closest.distanceTo(c) < 0.8 && t < bestT) {
+                          best = e;
+                          bestT = t;
+                      }
+                  }
+                  return best;
+              }
+
+              static void select(ServerPlayerEntity p, MinecraftServer s, Entity e) {
+                  load(e);
+                  selected.put(p.getUuid(), e.getUuid());
+                  send(p, "OPEN stick");
+                  sendState(p);
+                  sendPose(s, p);
+              }
+
+              public static void openPaper(ServerPlayerEntity p) {
+                  send(p, "OPEN paper");
+                  sendState(p);
+              }
+
+              public static void stickUse(ServerPlayerEntity p, BlockHitResult hit) {
+                  MinecraftServer s = p.getServer();
+                  if (s == null) return;
+                  ServerWorld w = p.getServerWorld();
+                  double max = hit == null ? 6.0 : p.getEyePos().distanceTo(hit.getPos()) + 0.3;
+                  Entity picked = pick(p, w, max);
+                  if (picked != null) {
+                      select(p, s, picked);
+                      return;
+                  }
+                  if (hit == null) {
+                      msg(p, "Aim at a block or at an animated block");
+                      return;
+                  }
+                  BlockPos bp = hit.getBlockPos();
+                  BlockState st = w.getBlockState(bp);
+                  if (st.isAir() || w.getBlockEntity(bp) != null || st.getHardness(w, bp) < 0 || !st.getFluidState().isEmpty()) {
+                      msg(p, "This block cannot be animated");
+                      return;
+                  }
+                  Entity e = EntityType.BLOCK_DISPLAY.create(w);
+                  if (e == null) return;
+                  e.refreshPositionAndAngles(bp.getX(), bp.getY(), bp.getZ(), 0f, 0f);
+                  NbtCompound n = e.writeNbt(new NbtCompound());
+                  n.put("block_state", NbtHelper.fromBlockState(st));
+                  UUID u = e.getUuid();
+                  e.readNbt(n);
+                  e.setUuid(u);
+                  e.addCommandTag("ta_obj");
+                  e.addCommandTag("ta_state:" + Block.getRawIdFromState(st));
+                  w.spawnEntity(e);
+                  w.setBlockState(bp, Blocks.AIR.getDefaultState());
+                  select(p, s, e);
+              }
+
+              // ---------- message router ----------
+              public static void handle(ServerPlayerEntity p, String msg) {
+                  MinecraftServer s = p.getServer();
+                  if (s == null) return;
+                  String[] a = msg.split(" ");
+                  if (a.length < 2) return;
+                  try {
+                      switch (a[1]) {
+                          case "goto": gotoFrame(s, Integer.parseInt(a[2])); break;
+                          case "next": gotoFrame(s, cur + 1); break;
+                          case "prev": gotoFrame(s, cur - 1); break;
+                          case "play": play(s); break;
+                          case "pause": playing = false; sync(s); break;
+                          case "undo": doUndo(p, s); break;
+                          case "add": addFrame(p, s); break;
+                          case "time": changeTime(s, Integer.parseInt(a[2])); break;
+                          case "set": setPose(p, s, a); break;
+                          case "reset": resetFrame(p, s); break;
+                          case "back": putBack(p, s); break;
+                          default: break;
+                      }
+                  } catch (RuntimeException ex) {
+                      // ignore bad message
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/animtool/client/AnimToolClient.java <<'EOF'
+          package com.example.animtool.client;
+
+          import com.example.animtool.ClientMsg;
+          import com.example.animtool.ServerMsg;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.MinecraftClient;
+
+          public class AnimToolClient implements ClientModInitializer {
+              public static int cur = 0;
+              public static int count = 2;
+              public static int dur = 20;
+              public static boolean playing = false;
+              public static boolean hasObj = false;
+              public static final float[] pose = new float[6];
+
+              public static void send(String s) {
+                  ClientPlayNetworking.send(new ClientMsg(s));
+              }
+
+              @Override
+              public void onInitializeClient() {
+                  ClientPlayNetworking.registerGlobalReceiver(ServerMsg.ID, (payload, context) -> handle(payload.text()));
+              }
+
+              static void handle(String m) {
+                  try {
+                      String[] a = m.split(" ");
+                      MinecraftClient mc = MinecraftClient.getInstance();
+                      switch (a[0]) {
+                          case "S": {
+                              int oldCount = count;
+                              cur = Integer.parseInt(a[1]);
+                              count = Integer.parseInt(a[2]);
+                              playing = a[3].equals("1");
+                              dur = Integer.parseInt(a[4]);
+                              if (oldCount != count && mc.currentScreen instanceof PaperScreen) {
+                                  mc.setScreen(new PaperScreen());
+                              }
+                              break;
+                          }
+                          case "P": {
+                              if (a[1].equals("none")) {
+                                  hasObj = false;
+                              } else {
+                                  hasObj = true;
+                                  for (int k = 0; k < 6; k++) pose[k] = Float.parseFloat(a[1 + k]);
+                              }
+                              if (mc.currentScreen instanceof StickScreen ss) ss.refresh();
+                              break;
+                          }
+                          case "OPEN": {
+                              if (a[1].equals("paper")) mc.setScreen(new PaperScreen());
+                              else mc.setScreen(new StickScreen());
+                              break;
+                          }
+                          case "CLOSE": {
+                              mc.setScreen(null);
+                              break;
+                          }
+                          default: break;
+                      }
+                  } catch (RuntimeException ex) {
+                      // ignore bad message
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/animtool/client/PaperScreen.java <<'EOF'
+          package com.example.animtool.client;
+
+          import java.util.Locale;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.text.Text;
+
+          public class PaperScreen extends Screen {
+              public PaperScreen() {
+                  super(Text.literal("Animation Timeline"));
+              }
+
+              private void btn(int x, int y, int w, String label, String cmd) {
+                  addDrawableChild(ButtonWidget.builder(Text.literal(label), b -> AnimToolClient.send(cmd))
+                      .dimensions(x, y, w, 20).build());
+              }
+
+              @Override
+              protected void init() {
+                  int cx = width / 2;
+                  int x0 = cx - 145;
+                  btn(x0, 34, 56, "< Prev", "paper prev");
+                  btn(x0 + 58, 34, 56, "Next >", "paper next");
+                  btn(x0 + 116, 34, 56, "PLAY", "paper play");
+                  btn(x0 + 174, 34, 56, "PAUSE", "paper pause");
+                  btn(x0 + 232, 34, 56, "UNDO", "paper undo");
+                  btn(x0, 58, 140, "+ ADD FRAME", "paper add");
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Close"), b -> close())
+                      .dimensions(x0 + 148, 58, 140, 20).build());
+                  btn(cx - 90, 98, 44, "-10", "paper time -10");
+                  btn(cx - 44, 98, 44, "-1", "paper time -1");
+                  btn(cx + 2, 98, 44, "+1", "paper time 1");
+                  btn(cx + 48, 98, 44, "+10", "paper time 10");
+                  for (int i = 0; i < AnimToolClient.count; i++) {
+                      String label = (i == AnimToolClient.cur ? "\u00a7a" : "") + (i + 1);
+                      btn(x0 + (i % 10) * 29, 136 + (i / 10) * 22, 27, label, "paper goto " + i);
+                  }
+              }
+
+              @Override
+              public boolean shouldPause() {
+                  return false;
+              }
+
+              @Override
+              public void render(DrawContext c, int mx, int my, float delta) {
+                  super.render(c, mx, my, delta);
+                  int cx = width / 2;
+                  c.drawCenteredTextWithShadow(textRenderer, "Animation Timeline", cx, 8, 0xFFFFFFFF);
+                  String st = "Frame " + (AnimToolClient.cur + 1) + " / " + AnimToolClient.count
+                      + (AnimToolClient.playing ? "  - PLAYING" : "  - paused");
+                  c.drawCenteredTextWithShadow(textRenderer, st, cx, 21, 0xFF55FFFF);
+                  String tm = AnimToolClient.cur == 0
+                      ? "First frame = starting pose"
+                      : "Ticks to reach this frame: " + AnimToolClient.dur
+                          + " (" + String.format(Locale.ROOT, "%.1f", AnimToolClient.dur / 20.0) + " s)";
+                  c.drawCenteredTextWithShadow(textRenderer, tm, cx, 86, 0xFFFFFF55);
+                  c.drawCenteredTextWithShadow(textRenderer, "Frames (tap to jump):", cx, 124, 0xFFAAAAAA);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/animtool/client/StickScreen.java <<'EOF'
+          package com.example.animtool.client;
+
+          import java.util.Locale;
+          import java.util.function.DoubleConsumer;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.SliderWidget;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.math.MathHelper;
+
+          public class StickScreen extends Screen {
+              private final Slide[] sl = new Slide[6];
+
+              public StickScreen() {
+                  super(Text.literal("Animation Mover"));
+              }
+
+              static class Slide extends SliderWidget {
+                  private final String label;
+                  private final double min;
+                  private final double max;
+                  private final double step;
+                  private final DoubleConsumer cb;
+
+                  Slide(int x, int y, int w, int h, String label, double min, double max, double step, double start, DoubleConsumer cb) {
+                      super(x, y, w, h, Text.empty(), MathHelper.clamp((start - min) / (max - min), 0.0, 1.0));
+                      this.label = label;
+                      this.min = min;
+                      this.max = max;
+                      this.step = step;
+                      this.cb = cb;
+                      updateMessage();
+                  }
+
+                  double get() {
+                      double raw = min + value * (max - min);
+                      return Math.round(raw / step) * step;
+                  }
+
+                  void setTo(double v) {
+                      value = MathHelper.clamp((v - min) / (max - min), 0.0, 1.0);
+                      updateMessage();
+                  }
+
+                  @Override
+                  protected void updateMessage() {
+                      if (label == null) return;
+                      setMessage(Text.literal(label + ": " + String.format(Locale.ROOT, "%.1f", get())));
+                  }
+
+                  @Override
+                  protected void applyValue() {
+                      cb.accept(get());
+                  }
+              }
+
+              private void sendPose() {
+                  float[] p = AnimToolClient.pose;
+                  AnimToolClient.send("stick set " + p[0] + " " + p[1] + " " + p[2] + " " + p[3] + " " + p[4] + " " + p[5]);
+              }
+
+              private void btn(int x, int y, int w, String label, String cmd) {
+                  addDrawableChild(ButtonWidget.builder(Text.literal(label), b -> AnimToolClient.send(cmd))
+                      .dimensions(x, y, w, 20).build());
+              }
+
+              @Override
+              protected void init() {
+                  int cx = width / 2;
+                  String[] names = {"Left/Right (X)", "Up/Down (Y)", "Front/Back (Z)", "Rotate X", "Rotate Y", "Rotate Z"};
+                  for (int i = 0; i < 6; i++) {
+                      int col = i / 3;
+                      int row = i % 3;
+                      int x = col == 0 ? cx - 155 : cx + 5;
+                      int y = 40 + row * 24;
+                      double min = i < 3 ? -6 : -180;
+                      double max = i < 3 ? 6 : 180;
+                      double step = i < 3 ? 0.1 : 1.0;
+                      final int idx = i;
+                      sl[i] = new Slide(x, y, 150, 20, names[i], min, max, step, AnimToolClient.pose[i], v -> {
+                          AnimToolClient.pose[idx] = (float) v;
+                          sendPose();
+                      });
+                      addDrawableChild(sl[i]);
+                  }
+                  btn(cx - 155, 118, 70, "< Frame", "stick prev");
+                  btn(cx + 85, 118, 70, "Frame >", "stick next");
+                  btn(cx - 155, 144, 150, "Reset this frame", "stick reset");
+                  btn(cx + 5, 144, 150, "Put back as block", "stick back");
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Close"), b -> close())
+                      .dimensions(cx - 50, 168, 100, 20).build());
+              }
+
+              public void refresh() {
+                  for (int i = 0; i < 6; i++) {
+                      if (sl[i] != null) sl[i].setTo(AnimToolClient.pose[i]);
+                  }
+              }
+
+              @Override
+              public boolean shouldPause() {
+                  return false;
+              }
+
+              @Override
+              public void render(DrawContext c, int mx, int my, float delta) {
+                  super.render(c, mx, my, delta);
+                  int cx = width / 2;
+                  c.drawCenteredTextWithShadow(textRenderer, "Animation Mover", cx, 8, 0xFFFFFFFF);
+                  c.drawCenteredTextWithShadow(textRenderer, "MOVE (blocks)", cx - 80, 28, 0xFF55FFFF);
+                  c.drawCenteredTextWithShadow(textRenderer, "ROTATE (degrees)", cx + 80, 28, 0xFFFFFF55);
+                  c.drawCenteredTextWithShadow(textRenderer,
+                      "Frame " + (AnimToolClient.cur + 1) + " / " + AnimToolClient.count, cx, 124, 0xFFFFFFFF);
+              }
+          }
+          EOF
+
+      - name: Run gradle build
+        run: gradle build --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: animtool-jar
+          path: build/libs/*.jar
